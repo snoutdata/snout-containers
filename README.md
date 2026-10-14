@@ -124,6 +124,7 @@ anywhere else, as root:
    Environment=CONTAINERS_CONF=/etc/snoutct/containers.conf
    ExecStartPre=/usr/bin/mkdir -p %t/snoutct
    ExecStart=/usr/bin/podman system service --time=0 unix://%t/snoutct/podman.sock
+   KillMode=process
    Restart=always
 
    [Install]
@@ -132,7 +133,10 @@ anywhere else, as root:
 
    then `systemctl --user enable --now snoutct-podman.service`. A service of its own, because
    podman's API takes no per-container runtime: the defaults above apply only to what is made
-   through this socket, and nothing else that user runs is affected.
+   through this socket, and nothing else that user runs is affected. `KillMode=process` is what
+   podman's own unit has, and it matters here: the service is the parent of every published port's
+   forwarder (`rootlessport`), so without it a restart of the service stops every container's port
+   while the containers themselves stay up.
 
 5. **nftables** (`/usr/sbin/nft`), for the limits on what containers send.
 
