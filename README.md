@@ -69,8 +69,13 @@ other side.
 The runner applies the table before it starts anything, checks it every minute and after every
 container it makes, and applies it again when it is missing or different. Once a minute it reads
 the table's counters, and each container's row in `status.json` carries what it sent, opened, was
-refused and was throttled in the last hour (`egress`). In SnoutData Cloud those figures go to the
-control plane, which emails the owner and us when an hour looks like abuse.
+refused and was throttled in the last hour (`egress`), plus `totalSentBytes`, a running total of
+what it sent, counted from zero whenever `epoch` changes (a new runner, or the container made anew).
+Whoever adds totals up takes the difference while the epoch holds and the whole total when it
+moves, so a status read twice or missed never counts a byte twice. A new runner starts from what
+the table already holds, which the runner before it counted. In SnoutData Cloud those figures go to
+the control plane, which emails the owner and us when an hour looks like abuse, and stops a
+project's containers for the rest of the month once they have sent its allowance.
 
 It reaches nftables through the host user's systemd: `systemd-run --user --pipe --wait` runs
 `podman unshare --rootless-netns /usr/sbin/nft` on the host, so the host needs `nftables`
@@ -144,7 +149,7 @@ podman run -d --name snout-containers \
   -v $PWD/manifests:/manifests:ro \
   -v $PWD/state:/state \
   -e SNOUT_CONTAINERS_BIND=127.0.0.1 \
-  ghcr.io/snoutdata/snout-containers:0.1.1
+  ghcr.io/snoutdata/snout-containers:0.1.2
 ```
 
 as the same rootless user, with podman's default user mapping (the runner's root is that user, so

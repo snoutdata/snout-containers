@@ -80,8 +80,19 @@ export interface StatusRow {
 	readonly status: Status;
 	readonly detail: string | null;
 	readonly restarts: number;
-	/** What it sent in the last hour; absent when egress is not measured on this host. */
-	readonly egress?: EgressCounters;
+	/** What it sent in the last hour, and in all; absent when egress is not measured on this host. */
+	readonly egress?: EgressReport;
+}
+
+/**
+ * The last hour's counters, plus a running total of the bytes it sent. The total counts from zero
+ * whenever `epoch` changes (a new runner, or the container made anew after being removed), so
+ * whoever adds it up takes the difference while the epoch holds and the whole total when it moves:
+ * a report read twice, or lost, never counts a byte twice.
+ */
+export interface EgressReport extends EgressCounters {
+	readonly epoch: string;
+	readonly totalSentBytes: number;
 }
 
 export interface LogRow {
@@ -192,6 +203,12 @@ export function createRunner(options: RunnerOptions) {
 	let egress: { ok: boolean; reason: string | null; at: number } | null = null;
 	/** The counters as last read, by address, and what each container sent minute by minute. */
 	let lastCounters = new Map<string, EgressCounters>();
+	/**
+	 * False until the first read: the table outlives a runner, so what it already holds was counted
+	 * by the one before, and the first read is only a starting point.
+	 */
+	let primed = false;
+	const totals = new Map<string, { epoch: string; sentBytes: number }>();
 	let lastMeasured = 0;
 	const sent = new Map<string, { at: number; delta: EgressCounters }[]>();
 
@@ -265,6 +282,7 @@ export function createRunner(options: RunnerOptions) {
 		egress = { ok: true, reason: null, at: now() };
 		// A new table counts from zero.
 		lastCounters = new Map();
+		primed = true;
 		return new Map();
 	}
 
@@ -289,6 +307,11 @@ export function createRunner(options: RunnerOptions) {
 	/** Attributes what the counters moved since the last read to the containers holding each address. */
 	function account(counters: Map<string, EgressCounters>, holders: Map<string, string>): void {
 		const at = now();
+		if (!primed) {
+			lastCounters = counters;
+			primed = true;
+			return;
+		}
 		for (const [key, address] of holders) {
 			const current = counters.get(address) ?? NO_EGRESS;
 			const before = lastCounters.get(address) ?? NO_EGRESS;
@@ -304,6 +327,9 @@ export function createRunner(options: RunnerOptions) {
 			const samples = sent.get(key) ?? [];
 			samples.push({ at, delta });
 			sent.set(key, samples);
+			const total = totals.get(key) ?? { epoch: randomBytes(8).toString('hex'), sentBytes: 0 };
+			total.sentBytes += delta.sentBytes;
+			totals.set(key, total);
 		}
 		for (const [key, samples] of sent) {
 			const kept = samples.filter((sample) => at - sample.at < EGRESS_WINDOW_MS);
@@ -316,11 +342,16 @@ export function createRunner(options: RunnerOptions) {
 		lastCounters = counters;
 	}
 
-	function lastHour(key: string): EgressCounters | undefined {
+	function lastHour(key: string): EgressReport | undefined {
 		if (!egressOptions) {
 			return undefined;
 		}
-		const total = { ...NO_EGRESS };
+		let running = totals.get(key);
+		if (!running) {
+			running = { epoch: randomBytes(8).toString('hex'), sentBytes: 0 };
+			totals.set(key, running);
+		}
+		const total = { ...NO_EGRESS, epoch: running.epoch, totalSentBytes: running.sentBytes };
 		for (const { delta } of sent.get(key) ?? []) {
 			total.sentBytes += delta.sentBytes;
 			total.sentPackets += delta.sentPackets;
@@ -552,6 +583,8 @@ export function createRunner(options: RunnerOptions) {
 					log(`${container.project}: removing ${container.name}`);
 					await remove(container);
 					tracking.delete(`${container.project}/${container.name}`);
+					totals.delete(`${container.project}/${container.name}`);
+					sent.delete(`${container.project}/${container.name}`);
 				}
 			}
 			const nets = await networks();

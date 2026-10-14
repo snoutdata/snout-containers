@@ -328,3 +328,33 @@ test('each container reports what it sent and was refused in the last hour, by i
 	assert.equal(by.acme?.egress?.sentBytes, 0, 'an hour later it is gone from the window');
 	assert.equal(t.status().containers.find((r: { project: string }) => r.project === 'beta').egress.refused, 0);
 });
+
+test('a running total with an epoch: it grows while the runner lives, and a new runner starts from what the table holds', async () => {
+	const t = await setup();
+	await t.put('acme', manifest('acme'));
+	await t.runner.step();
+	t.engine.firewall.counters.set('10.95.0.2', { sentBytes: 1000, refused: 0 });
+	t.advance(61_000);
+	let row = (await t.runner.step())[0];
+	const epoch = row?.egress?.epoch;
+	assert.match(epoch ?? '', /^[0-9a-f]{16}$/);
+	assert.equal(row?.egress?.totalSentBytes, 1000);
+	t.engine.firewall.counters.set('10.95.0.2', { sentBytes: 4000, refused: 0 });
+	t.advance(61_000);
+	row = (await t.runner.step())[0];
+	assert.equal(row?.egress?.epoch, epoch);
+	assert.equal(row?.egress?.totalSentBytes, 4000);
+
+	// A second runner over the same table: what the table holds was the first one's to count.
+	let calls = 0;
+	const again = createRunner({ exec: t.engine.exec, manifests: t.manifests, state: t.state, bind: ['127.0.0.1', '10.0.1.20'], now: () => Date.parse('2026-10-13T20:00:00Z') + calls++ * 61_000 });
+	await again.step();
+	row = (await again.step())[0];
+	assert.notEqual(row?.egress?.epoch, epoch);
+	assert.equal(row?.egress?.totalSentBytes, 0, 'a new runner counted the table\'s past as its own');
+	assert.equal(row?.egress?.sentBytes, 0);
+	t.engine.firewall.counters.set('10.95.0.2', { sentBytes: 4500, refused: 0 });
+	await again.step();
+	row = (await again.step())[0];
+	assert.equal(row?.egress?.totalSentBytes, 500);
+});
