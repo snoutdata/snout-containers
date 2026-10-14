@@ -9,11 +9,16 @@
  *                                (default 127.0.0.1)
  *   SNOUT_CONTAINERS_POOL        the range project networks are carved from (default 10.95.0.0/16)
  *   SNOUT_CONTAINERS_STEP_MS     how often to reconcile (default 5000)
+ *   SNOUT_CONTAINERS_EGRESS      enforce (default): the limits on what containers send must be in
+ *                                the host's firewall before a container starts; measure: put them
+ *                                there and report, but start containers without them; off: leave
+ *                                the firewall alone (an engine that is not rootless podman)
  *   CONTAINER_HOST               the engine's podman socket, unix:///run/snoutct/podman.sock
  *   DBUS_SESSION_BUS_ADDRESS     the host user's systemd bus, for the containers' slices
  *   PORT                         where /health answers (default 8080)
  *
- * `/health` answers 200 once a step has run and the engine is gVisor, 503 with the reason otherwise.
+ * `/health` answers 200 once a step has run, the engine is gVisor and (enforced) the egress limits are
+ * in place, 503 with the reason otherwise.
  */
 
 import { execFile } from 'node:child_process';
@@ -22,7 +27,7 @@ import { createRunner, type Exec } from './runner.js';
 
 const exec: Exec = (command, args, options = {}) =>
 	new Promise((resolve, reject) => {
-		execFile(
+		const child = execFile(
 			command,
 			[...args],
 			{
@@ -39,6 +44,7 @@ const exec: Exec = (command, args, options = {}) =>
 				resolve({ code, stdout: String(stdout), stderr: String(stderr) });
 			}
 		);
+		child.stdin?.end(options.input ?? '');
 	});
 
 function log(message: string): void {
@@ -55,8 +61,18 @@ const runner = createRunner({
 		.map((one) => one.trim())
 		.filter(Boolean),
 	pool: process.env.SNOUT_CONTAINERS_POOL ?? '10.95.0.0/16',
+	egress: egressMode() === 'off' ? false : { enforce: egressMode() === 'enforce' },
 	log
 });
+
+function egressMode(): 'enforce' | 'measure' | 'off' {
+	const mode = (process.env.SNOUT_CONTAINERS_EGRESS ?? 'enforce').trim().toLowerCase();
+	if (mode === 'off' || mode === 'measure' || mode === 'enforce') {
+		return mode;
+	}
+	log(`SNOUT_CONTAINERS_EGRESS=${mode} is not enforce, measure or off; enforcing`);
+	return 'enforce';
+}
 
 let health: { ok: boolean; detail: string } = { ok: false, detail: 'starting' };
 const stepMs = Number(process.env.SNOUT_CONTAINERS_STEP_MS ?? 5000);
@@ -66,8 +82,8 @@ async function loop(): Promise<void> {
 	let lastLogs = 0;
 	while (!stopping) {
 		const rows = await runner.step();
-		const engine = runner.engineReason();
-		health = engine ? { ok: false, detail: engine } : { ok: true, detail: `${rows.length} container(s)` };
+		const problem = runner.engineReason() ?? runner.egressReason();
+		health = problem ? { ok: false, detail: problem } : { ok: true, detail: `${rows.length} container(s)` };
 		if (Date.now() - lastLogs >= 60_000) {
 			lastLogs = Date.now();
 			await runner.collectLogs();

@@ -42,8 +42,40 @@ to read and delete.
   metadata service and every private range (`10/8`, `172.16/12`, `192.168/16`, `169.254/16`)
   routed to an address nothing holds. A container reaches the public internet and its own
   project's containers, and nothing else: not the host's network, not another project's containers.
+- **Limits on what it sends** (below): a connection rate, a number held open, a bandwidth, and
+  port 25 closed.
 - **No secret on a command line**: the environment reaches podman through a 0600 file deleted as
   soon as the container is made, and a registry login through an auth file the same way.
+
+### What a container may send
+
+The public internet is open to a container, so the limits are on how much and how fast. They live in
+one nftables table, `inet snoutct`, in the network namespace the containers' bridges are in
+(rootless podman's), hooked into forwarding just before netavark's, and they touch only packets
+from the pool:
+
+| | Default |
+| --- | --- |
+| New connections it opens | 20 a second, bursts of 200 |
+| Connections it opened, held at once | 1,000 |
+| Bytes a second on connections it opened | 2 MB, bursts of 8 MB |
+| TCP ports it may not open | 25 |
+
+Past a limit a new connection is refused (a TCP reset, an ICMP refusal otherwise) and bytes over
+the rate are dropped. A UDP flow is "new" until something answers, so a flood at a silent address
+is held to the connection rate. Connections TO a container are not limited: they began on the
+other side.
+
+The runner applies the table before it starts anything, checks it every minute and after every
+container it makes, and applies it again when it is missing or different. Once a minute it reads
+the table's counters, and each container's row in `status.json` carries what it sent, opened, was
+refused and was throttled in the last hour (`egress`). In SnoutData Cloud those figures go to the
+control plane, which emails the owner and us when an hour looks like abuse.
+
+It reaches nftables through the host user's systemd: `systemd-run --user --pipe --wait` runs
+`podman unshare --rootless-netns /usr/sbin/nft` on the host, so the host needs `nftables`
+installed, and the engine must be rootless podman. On anything else set `SNOUT_CONTAINERS_EGRESS=off`
+and limit egress another way.
 
 If the engine's podman does not report the runtime `runsc-snoutct`, the runner makes nothing at
 all and reports every container as `failed` with the reason. It never runs an image under an
@@ -97,7 +129,10 @@ anywhere else, as root:
    podman's API takes no per-container runtime: the defaults above apply only to what is made
    through this socket, and nothing else that user runs is affected.
 
-Measured on Debian 13, podman 5.4.2, gVisor `release-20261005.0`, arm64.
+5. **nftables** (`/usr/sbin/nft`), for the limits on what containers send.
+
+Measured on Debian 13, podman 5.4.2, netavark 1.14 (nftables), nftables 1.1.3, gVisor
+`release-20261005.0`, arm64.
 
 ## Running it
 
@@ -109,12 +144,12 @@ podman run -d --name snout-containers \
   -v $PWD/manifests:/manifests:ro \
   -v $PWD/state:/state \
   -e SNOUT_CONTAINERS_BIND=127.0.0.1 \
-  ghcr.io/snoutdata/snout-containers:0.1.0
+  ghcr.io/snoutdata/snout-containers:0.1.1
 ```
 
 as the same rootless user, with podman's default user mapping (the runner's root is that user, so
 the user's systemd accepts it on its bus). It is a podman client: it reaches the engine through the
-socket, and the user's systemd through the bus to set each container's slice.
+socket, and the user's systemd through the bus to set each container's slice and to reach nftables.
 
 | Variable | Default | |
 | --- | --- | --- |
@@ -123,11 +158,13 @@ socket, and the user's systemd through the bus to set each container's slice.
 | `SNOUT_CONTAINERS_BIND` | `127.0.0.1` | comma-separated addresses a `hostPort` is published on |
 | `SNOUT_CONTAINERS_POOL` | `10.95.0.0/16` | where project networks' /28s come from |
 | `SNOUT_CONTAINERS_STEP_MS` | `5000` | how often it reconciles |
+| `SNOUT_CONTAINERS_EGRESS` | `enforce` | `enforce`: nothing new starts until the egress limits are in place; `measure`: apply and report, but start anyway; `off`: leave the firewall alone |
 | `CONTAINER_HOST` | `unix:///run/snoutct/podman.sock` | the engine's socket |
 | `DBUS_SESSION_BUS_ADDRESS` | | the user's systemd bus |
 | `PORT` | `8080` | where `/health` answers |
 
-`/health` answers 200 when the engine is gVisor and 503 with the reason when it is not.
+`/health` answers 200 when the engine is gVisor and, enforced, the egress limits are in place, and
+503 with the reason when not.
 
 ## The manifest
 

@@ -260,3 +260,172 @@ export function registryOf(image: string): string {
 	}
 	return 'docker.io';
 }
+
+// ------------------------------------------------------------------------------
+// Egress: what a container may send, and what it did
+// ------------------------------------------------------------------------------
+
+/**
+ * The limits on what a container SENDS, the same for every container on a host. The public
+ * internet is open to it (that is the point of one), so these are about how much and how fast,
+ * not where: enough for a client that keeps a few connections open, far short of a scan, a flood
+ * or a mail run from our address.
+ */
+export interface EgressPolicy {
+	/** New connections a container may open each second, sustained... */
+	readonly newPerSecond: number;
+	/** ...with this many at once before the rate applies. */
+	readonly newBurst: number;
+	/** Connections it opened that it may hold open at once. */
+	readonly held: number;
+	/** Bytes a second it may send on the connections it opened, sustained... */
+	readonly bytesPerSecond: number;
+	/** ...with this many at once before the rate applies. */
+	readonly burstBytes: number;
+	/** TCP ports it may never open a connection to. 25 is mail from server to server, and spam. */
+	readonly closedPorts: readonly number[];
+}
+
+export const EGRESS_POLICY: EgressPolicy = {
+	newPerSecond: 20,
+	newBurst: 200,
+	held: 1000,
+	bytesPerSecond: 2 * 1024 * 1024,
+	burstBytes: 8 * 1024 * 1024,
+	closedPorts: [25]
+};
+
+/** The nftables table that holds it, in the network namespace the containers' bridges are in. */
+export const EGRESS_TABLE = 'snoutct';
+
+/** The policy and the pool, hashed: written on the table, so a changed one is applied again. */
+export function egressFingerprint(pool: string, policy: EgressPolicy): string {
+	return createHash('sha256').update(JSON.stringify(['snoutct-egress-1', pool, policy])).digest('hex').slice(0, 16);
+}
+
+/**
+ * The ruleset, as `nft -f` reads it. It replaces the table whole (creating it first so the delete
+ * cannot fail), which also zeroes the counters; the runner reads them as deltas and survives that.
+ *
+ * It is ONE table beside netavark's, hooked into forwarding just before it, and it touches only
+ * packets from the pool, so the pods' networks never meet it. Per container, keyed by its address:
+ *
+ *   - `sent`: everything it sent (packets, bytes), replies to its own callers included.
+ *   - a connection it OPENS (`ct direction original`, state new): refused when it is to a closed
+ *     port, over the rate, or over the number it may hold; counted in `opened` when it is not.
+ *     A UDP flow stays "new" until something answers, so a flood at a silent address is held to
+ *     the same rate.
+ *   - on what it opened, bytes over the bandwidth are dropped and counted in `throttled`.
+ *   - `refused`: what it was refused. TCP gets a reset, so the client fails at once.
+ *
+ * Connections TO it (the front door's, websockets) are untouched: they began on the other side.
+ */
+export function egressRuleset(pool: string, policy: EgressPolicy = EGRESS_POLICY): string {
+	parseCidr(pool);
+	const counted = (name: string) => `\tset ${name} { type ipv4_addr; flags dynamic; counter; size 65536; }`;
+	const lines = [
+		`table inet ${EGRESS_TABLE}`,
+		`delete table inet ${EGRESS_TABLE}`,
+		`table inet ${EGRESS_TABLE} {`,
+		`\tcomment "${egressFingerprint(pool, policy)}"`,
+		counted('sent'),
+		counted('opened'),
+		counted('refused'),
+		counted('throttled'),
+		'\tset rate { type ipv4_addr; flags dynamic; timeout 1m; size 65536; }',
+		'\tset bandwidth { type ipv4_addr; flags dynamic; timeout 1m; size 65536; }',
+		'\tset held { type ipv4_addr; flags dynamic; size 65536; }',
+		'',
+		'\tchain forward {',
+		'\t\ttype filter hook forward priority filter - 10; policy accept;',
+		'\t\tmeta nfproto != ipv4 return',
+		`\t\tip saddr != ${pool} return`,
+		'\t\tupdate @sent { ip saddr }',
+		'\t\tct direction reply return',
+		'\t\tct state new jump open',
+		`\t\tadd @bandwidth { ip saddr limit rate over ${policy.bytesPerSecond} bytes/second burst ${policy.burstBytes} bytes } update @throttled { ip saddr } drop`,
+		'\t}',
+		'',
+		'\tchain open {'
+	];
+	if (policy.closedPorts.length > 0) {
+		lines.push(`\t\ttcp dport { ${policy.closedPorts.join(', ')} } jump refuse`);
+	}
+	lines.push(
+		`\t\tadd @rate { ip saddr limit rate over ${policy.newPerSecond}/second burst ${policy.newBurst} packets } jump refuse`,
+		`\t\tadd @held { ip saddr ct count over ${policy.held} } jump refuse`,
+		'\t\tupdate @opened { ip saddr }',
+		'\t}',
+		'',
+		'\tchain refuse {',
+		'\t\tupdate @refused { ip saddr }',
+		'\t\tmeta l4proto tcp reject with tcp reset',
+		'\t\treject with icmpx admin-prohibited',
+		'\t}',
+		'}',
+		''
+	);
+	return lines.join('\n');
+}
+
+/** One container's counters, as the kernel keeps them (they only grow, until the table is replaced). */
+export interface EgressCounters {
+	readonly sentBytes: number;
+	readonly sentPackets: number;
+	readonly opened: number;
+	readonly refused: number;
+	readonly throttledBytes: number;
+}
+
+export const NO_EGRESS: EgressCounters = { sentBytes: 0, sentPackets: 0, opened: 0, refused: 0, throttledBytes: 0 };
+
+/**
+ * `nft -j list table inet snoutct` read back: the table's fingerprint and each address's counters.
+ * Null when the output is not that table.
+ */
+export function parseEgress(json: string): { fingerprint: string | null; counters: Map<string, EgressCounters> } | null {
+	let doc: { nftables?: Record<string, unknown>[] };
+	try {
+		doc = JSON.parse(json) as { nftables?: Record<string, unknown>[] };
+	} catch {
+		return null;
+	}
+	if (!Array.isArray(doc.nftables)) {
+		return null;
+	}
+	let fingerprint: string | null = null;
+	let found = false;
+	const counters = new Map<string, { sentBytes: number; sentPackets: number; opened: number; refused: number; throttledBytes: number }>();
+	for (const item of doc.nftables) {
+		const table = item.table as { name?: string; comment?: string } | undefined;
+		if (table?.name === EGRESS_TABLE) {
+			found = true;
+			fingerprint = typeof table.comment === 'string' ? table.comment : null;
+		}
+		const set = item.set as { name?: string; table?: string; elem?: { elem?: { val?: unknown; counter?: { packets?: number; bytes?: number } } }[] } | undefined;
+		if (!set || set.table !== EGRESS_TABLE || !['sent', 'opened', 'refused', 'throttled'].includes(String(set.name))) {
+			continue;
+		}
+		for (const entry of set.elem ?? []) {
+			const address = entry.elem?.val;
+			if (typeof address !== 'string') {
+				continue;
+			}
+			const packets = Number(entry.elem?.counter?.packets ?? 0) || 0;
+			const bytes = Number(entry.elem?.counter?.bytes ?? 0) || 0;
+			const one = counters.get(address) ?? { ...NO_EGRESS };
+			if (set.name === 'sent') {
+				one.sentBytes = bytes;
+				one.sentPackets = packets;
+			} else if (set.name === 'opened') {
+				one.opened = packets;
+			} else if (set.name === 'refused') {
+				one.refused = packets;
+			} else {
+				one.throttledBytes = bytes;
+			}
+			counters.set(address, one);
+		}
+	}
+	return found ? { fingerprint, counters } : null;
+}

@@ -55,3 +55,38 @@ test('the registry of an image, as docker reads it', () => {
 	assert.equal(registryOf('nginx'), 'docker.io');
 	assert.equal(registryOf('localhost:5000/x'), 'localhost:5000');
 });
+
+test('the egress ruleset: one table, the pool only, port 25 closed, the rate, the count and the bandwidth', async () => {
+	const { egressRuleset, egressFingerprint, EGRESS_POLICY } = await import('./recipe.js');
+	const rules = egressRuleset('10.95.0.0/16');
+	assert.match(rules, /^table inet snoutct\ndelete table inet snoutct\ntable inet snoutct \{/);
+	assert.ok(rules.includes(`comment "${egressFingerprint('10.95.0.0/16', EGRESS_POLICY)}"`));
+	assert.ok(rules.includes('ip saddr != 10.95.0.0/16 return'));
+	assert.ok(rules.includes('ct direction reply return'), 'connections to the container must not be limited');
+	assert.ok(rules.includes('tcp dport { 25 } jump refuse'));
+	assert.ok(rules.includes('limit rate over 20/second burst 200 packets'));
+	assert.ok(rules.includes('ct count over 1000'));
+	assert.ok(rules.includes('limit rate over 2097152 bytes/second burst 8388608 bytes'));
+	assert.notEqual(egressFingerprint('10.95.0.0/16', EGRESS_POLICY), egressFingerprint('10.96.0.0/16', EGRESS_POLICY));
+	assert.ok(!egressRuleset('10.95.0.0/16', { ...EGRESS_POLICY, closedPorts: [] }).includes('dport'));
+	assert.throws(() => egressRuleset('nope'), /not an IPv4 CIDR/);
+});
+
+test('nft -j output reads back as each address\'s counters and the table\'s fingerprint', async () => {
+	const { parseEgress } = await import('./recipe.js');
+	const json = JSON.stringify({
+		nftables: [
+			{ metainfo: { version: '1.1.3' } },
+			{ table: { family: 'inet', name: 'snoutct', handle: 19, comment: 'abc' } },
+			{ set: { family: 'inet', name: 'sent', table: 'snoutct', elem: [{ elem: { val: '10.95.0.2', counter: { packets: 2067, bytes: 44527835 } } }] } },
+			{ set: { family: 'inet', name: 'refused', table: 'snoutct', elem: [{ elem: { val: '10.95.0.2', counter: { packets: 5, bytes: 300 } } }] } },
+			{ set: { family: 'inet', name: 'throttled', table: 'snoutct', elem: [{ elem: { val: '10.95.0.2', counter: { packets: 39, bytes: 2238636 } } }] } },
+			{ set: { family: 'inet', name: 'rate', table: 'snoutct', elem: [{ elem: { val: '10.95.0.2' } }] } }
+		]
+	});
+	const read = parseEgress(json);
+	assert.equal(read?.fingerprint, 'abc');
+	assert.deepEqual(read?.counters.get('10.95.0.2'), { sentBytes: 44527835, sentPackets: 2067, opened: 0, refused: 5, throttledBytes: 2238636 });
+	assert.equal(parseEgress('{"nftables":[{"metainfo":{}}]}'), null);
+	assert.equal(parseEgress('not json'), null);
+});

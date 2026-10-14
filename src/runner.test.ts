@@ -21,7 +21,19 @@ function fakeEngine(runtime = 'runsc-snoutct') {
 		{ name: 'podman', subnets: [{ subnet: '10.88.0.0/16' }], labels: {} }
 	];
 	const images = new Set<string>();
-	const exec = async (command: string, args: readonly string[], options?: { env?: Readonly<Record<string, string>> }): Promise<ExecResult> => {
+	/** The host's firewall, as nft in rootless podman's namespace would keep it. */
+	const firewall = {
+		table: null as string | null,
+		applied: 0,
+		broken: false,
+		counters: new Map<string, { sentBytes: number; refused: number }>(),
+		address: new Map<string, string>()
+	};
+	const exec = async (
+		command: string,
+		args: readonly string[],
+		options?: { env?: Readonly<Record<string, string>>; input?: string }
+	): Promise<ExecResult> => {
 		const files: Record<string, string> = {};
 		for (const [i, arg] of args.entries()) {
 			if ((arg === '--env-file' || arg === '--authfile') && existsSync(args[i + 1] as string)) {
@@ -33,9 +45,37 @@ function fakeEngine(runtime = 'runsc-snoutct') {
 		if (command === 'systemctl') {
 			return ok();
 		}
+		if (command === 'systemd-run') {
+			const nft = args.slice(args.indexOf('nft') + 1);
+			if (firewall.broken) {
+				return { code: 1, stdout: '', stderr: 'Error: Could not process rule: Operation not permitted' };
+			}
+			if (nft[0] === '-f') {
+				firewall.table = options?.input ?? '';
+				firewall.applied += 1;
+				firewall.counters.clear();
+				return ok();
+			}
+			if (!firewall.table) {
+				return { code: 1, stdout: '', stderr: 'Error: No such file or directory' };
+			}
+			const elems = (field: 'sentBytes' | 'refused') =>
+				[...firewall.counters].map(([val, c]) => ({ elem: { val, counter: { packets: field === 'refused' ? c.refused : 1, bytes: field === 'sentBytes' ? c.sentBytes : 0 } } }));
+			return ok(
+				JSON.stringify({
+					nftables: [
+						{ metainfo: {} },
+						{ table: { family: 'inet', name: 'snoutct', comment: /comment "([^"]+)"/.exec(firewall.table)?.[1] } },
+						{ set: { family: 'inet', table: 'snoutct', name: 'sent', elem: elems('sentBytes') } },
+						{ set: { family: 'inet', table: 'snoutct', name: 'refused', elem: elems('refused') } }
+					]
+				})
+			);
+		}
 		const [verb, sub] = args;
 		if (verb === 'info') return ok(`${runtime}\n`);
 		if (verb === 'ps') return ok(JSON.stringify(containers));
+		if (verb === 'inspect') return ok(args.slice(3).map((name) => `${name} ${firewall.address.get(name) ?? '10.95.0.2'} \n`).join(''));
 		if (verb === 'network' && sub === 'ls') return ok(JSON.stringify(nets));
 		if (verb === 'network' && sub === 'create') {
 			const name = args.at(-1) as string;
@@ -74,7 +114,7 @@ function fakeEngine(runtime = 'runsc-snoutct') {
 		}
 		return ok();
 	};
-	return { exec, calls, containers, nets, images };
+	return { exec, calls, containers, nets, images, firewall };
 }
 
 async function setup(runtime?: string) {
@@ -200,4 +240,91 @@ test('no engine at all: the manifests are still read, every container failed wit
 	assert.match(rows[0]?.detail ?? '', /cannot run containers yet: the container engine does not answer/);
 	assert.match(runner.engineReason() ?? '', /does not answer/);
 	void t;
+});
+
+test('the egress limits go in before the first container, and only once while they stay', async () => {
+	const t = await setup();
+	await t.put('acme', manifest('acme'));
+	const rows = await t.runner.step();
+	assert.equal(rows[0]?.status, 'starting');
+	assert.equal(t.engine.firewall.applied, 1);
+	assert.match(t.engine.firewall.table ?? '', /tcp dport \{ 25 \} jump refuse/);
+	assert.match(t.engine.firewall.table ?? '', /ip saddr != 10\.95\.0\.0\/16 return/);
+	const nft = t.engine.calls.find((c) => c.command === 'systemd-run');
+	assert.deepEqual(nft?.args.slice(0, 7), ['--user', '--pipe', '--wait', '--quiet', '--collect', '--', '/bin/sh']);
+	t.advance(5_000);
+	await t.runner.step();
+	t.advance(61_000);
+	await t.runner.step();
+	assert.equal(t.engine.firewall.applied, 1, 'a table in place was applied again');
+	assert.equal(t.status().egress, 'ok');
+	assert.equal(t.runner.egressReason(), null);
+});
+
+test('a table that went away is put back within a minute', async () => {
+	const t = await setup();
+	await t.put('acme', manifest('acme'));
+	await t.runner.step();
+	t.engine.firewall.table = null;
+	t.advance(61_000);
+	await t.runner.step();
+	assert.equal(t.engine.firewall.applied, 2);
+});
+
+test('no egress limits, no new container; one already running is left running', async () => {
+	const t = await setup();
+	await t.put('acme', manifest('acme'));
+	await t.runner.step();
+	t.engine.firewall.broken = true;
+	t.engine.firewall.table = null;
+	await t.put('beta', manifest('beta', { hostPort: 47432 }));
+	t.advance(61_000);
+	const rows = await t.runner.step();
+	const by = Object.fromEntries(rows.map((r) => [r.project, r]));
+	assert.equal(by.acme?.status, 'running');
+	assert.equal(by.beta?.status, 'failed');
+	assert.match(by.beta?.detail ?? '', /cannot start containers right now: the limits on what containers send could not be put in place: Error: Could not process rule/);
+	assert.equal(t.engine.containers.length, 1);
+	assert.match(t.runner.egressReason() ?? '', /could not be put in place/);
+	t.engine.firewall.broken = false;
+	t.advance(16_000);
+	await t.runner.step();
+	assert.equal(t.engine.containers.length, 2, 'it did not recover once the table could be applied');
+});
+
+test('egress off: the firewall is never touched', async () => {
+	const root = await mkdtemp(join(tmpdir(), 'ct-'));
+	await mkdir(join(root, 'm'));
+	await writeFile(join(root, 'm', 'acme.json'), JSON.stringify(manifest('acme')));
+	const engine = fakeEngine();
+	const runner = createRunner({ exec: engine.exec, manifests: join(root, 'm'), state: join(root, 's'), bind: ['127.0.0.1'], egress: false });
+	const rows = await runner.step();
+	assert.equal(rows[0]?.status, 'starting');
+	assert.equal(rows[0]?.egress, undefined);
+	assert.equal(engine.calls.filter((c) => c.command === 'systemd-run').length, 0);
+});
+
+test('each container reports what it sent and was refused in the last hour, by its address', async () => {
+	const t = await setup();
+	await t.put('acme', manifest('acme'));
+	await t.put('beta', manifest('beta', { hostPort: 47432 }));
+	await t.runner.step();
+	t.engine.firewall.address.set('snoutct-beta-wa', '10.95.0.18');
+	t.engine.firewall.counters.set('10.95.0.2', { sentBytes: 1000, refused: 0 });
+	t.engine.firewall.counters.set('10.95.0.18', { sentBytes: 50, refused: 7 });
+	t.advance(61_000);
+	let rows = await t.runner.step();
+	let by = Object.fromEntries(rows.map((r) => [r.project, r]));
+	assert.equal(by.acme?.egress?.sentBytes, 1000);
+	assert.equal(by.beta?.egress?.refused, 7);
+	t.engine.firewall.counters.set('10.95.0.2', { sentBytes: 1500, refused: 0 });
+	t.advance(61_000);
+	rows = await t.runner.step();
+	by = Object.fromEntries(rows.map((r) => [r.project, r]));
+	assert.equal(by.acme?.egress?.sentBytes, 1500, 'the hour is the sum of the minutes');
+	t.advance(60 * 60_000);
+	rows = await t.runner.step();
+	by = Object.fromEntries(rows.map((r) => [r.project, r]));
+	assert.equal(by.acme?.egress?.sentBytes, 0, 'an hour later it is gone from the window');
+	assert.equal(t.status().containers.find((r: { project: string }) => r.project === 'beta').egress.refused, 0);
 });
