@@ -26,6 +26,16 @@
  * range routed to a sink address on the bridge where the packet dies: the instance metadata
  * service, the host's VPC and every other project's /28 are unreachable, the project's own
  * containers and the public internet are not.
+ *
+ * The networks are IPv4 only, and the deny routes are IPv4 routes, so IPv6 is dropped outright at
+ * the firewall (`egressRuleset`): whatever arrives from a project's bridge as IPv6 never leaves it.
+ *
+ * ## An allowlist per project, optional
+ *
+ * By default the public internet is open to a container, with the limits below. A project may set
+ * an allowlist of destinations (addresses, ranges or host names, with ports or without); its
+ * containers then reach those and nothing else. Host names are looked up by the runner, so the
+ * firewall holds addresses (`EgressMembers`).
  */
 
 import { createHash } from 'node:crypto';
@@ -298,9 +308,125 @@ export const EGRESS_POLICY: EgressPolicy = {
 /** The nftables table that holds it, in the network namespace the containers' bridges are in. */
 export const EGRESS_TABLE = 'snoutct';
 
-/** The policy and the pool, hashed: written on the table, so a changed one is applied again. */
+/**
+ * The policy and the pool, hashed: written on the table, so a changed one is applied again. The
+ * version moves with the table's SHAPE (2: the IPv6 drop and the allowlist's sets), so a runner
+ * that adds a chain replaces an older runner's table rather than trusting it.
+ */
 export function egressFingerprint(pool: string, policy: EgressPolicy): string {
-	return createHash('sha256').update(JSON.stringify(['snoutct-egress-1', pool, policy])).digest('hex').slice(0, 16);
+	return createHash('sha256').update(JSON.stringify(['snoutct-egress-2', pool, policy])).digest('hex').slice(0, 16);
+}
+
+/** One destination a restricted project may reach: its addresses, and its ports (none: any port). */
+export interface AllowedDestination {
+	/** IPv4 addresses or CIDRs. A host name is resolved before it gets here. */
+	readonly cidrs: readonly string[];
+	readonly ports: readonly number[];
+}
+
+/**
+ * What the egress table holds that changes with the projects, rather than with the policy: every
+ * project network's bridge (for the IPv6 drop), and the network of each project with an allowlist
+ * together with what it may reach. Applied with the table, and on its own (`egressMembersScript`)
+ * whenever it changes, so the table's counters are never zeroed for it.
+ */
+export interface EgressMembers {
+	readonly bridges: readonly string[];
+	readonly restricted: readonly { readonly subnet: string; readonly allow: readonly AllowedDestination[] }[];
+}
+
+export const NO_MEMBERS: EgressMembers = { bridges: [], restricted: [] };
+
+/** A bridge's name as nft reads it: what netavark names them, nothing that could close the quote. */
+const BRIDGE = /^[A-Za-z0-9_.-]{1,15}$/;
+
+/** `a.b.c.d` or `a.b.c.d/n`, normalised to its network address: `1.2.3.4/24` is `1.2.3.0/24`. */
+export function normaliseCidr(text: string): string {
+	const { base, bits } = parseCidr(text.includes('/') ? text : `${text}/32`);
+	return `${toAddress(base)}/${bits}`;
+}
+
+function contains(outer: string, inner: string): boolean {
+	const a = parseCidr(outer);
+	const b = parseCidr(inner);
+	if (a.bits > b.bits) {
+		return false;
+	}
+	const mask = a.bits === 0 ? 0 : (0xffffffff << (32 - a.bits)) >>> 0;
+	return ((b.base & mask) >>> 0) === a.base;
+}
+
+/** The ranges with every one inside another taken out, sorted: the kernel refuses an element twice. */
+function withoutOverlaps(cidrs: Iterable<string>): string[] {
+	const unique = [...new Set([...cidrs].map(normaliseCidr))];
+	return unique
+		.filter((one) => !unique.some((other) => other !== one && contains(other, one)))
+		.sort((x, y) => parseCidr(x).base - parseCidr(y).base || parseCidr(x).bits - parseCidr(y).bits);
+}
+
+/**
+ * The three sets' elements, as nft writes them. Per restricted project: its own /28 to itself (its
+ * containers reach each other), every destination with no port to any port, and each port of the
+ * rest. Ranges inside another range for the same project and port are left out.
+ */
+export function egressElements(members: EgressMembers): {
+	bridges: string[];
+	restricted: string[];
+	allowAny: string[];
+	allowPort: string[];
+} {
+	const bridges = [...new Set(members.bridges)].filter((name) => BRIDGE.test(name)).sort();
+	const restricted: string[] = [];
+	const allowAny: string[] = [];
+	const allowPort: string[] = [];
+	for (const project of [...members.restricted].sort((a, b) => parseCidr(a.subnet).base - parseCidr(b.subnet).base)) {
+		const subnet = normaliseCidr(project.subnet);
+		restricted.push(subnet);
+		const any = withoutOverlaps([subnet, ...project.allow.filter((one) => one.ports.length === 0).flatMap((one) => one.cidrs)]);
+		for (const cidr of any) {
+			allowAny.push(`${subnet} . ${cidr}`);
+		}
+		const byPort = new Map<number, string[]>();
+		for (const one of project.allow) {
+			for (const port of one.ports) {
+				byPort.set(port, [...(byPort.get(port) ?? []), ...one.cidrs]);
+			}
+		}
+		for (const port of [...byPort.keys()].sort((a, b) => a - b)) {
+			// Already reachable on every port: listing it again for one would overlap.
+			const kept = withoutOverlaps(byPort.get(port) ?? []).filter((cidr) => !any.some((outer) => contains(outer, cidr)));
+			for (const cidr of kept) {
+				allowPort.push(`${subnet} . ${cidr} . ${port}`);
+			}
+		}
+	}
+	return { bridges: bridges.map((name) => `"${name}"`), restricted, allowAny, allowPort };
+}
+
+/** The members, hashed: the runner applies them again only when this moves. */
+export function egressMembersKey(members: EgressMembers): string {
+	return createHash('sha256').update(JSON.stringify(egressElements(members))).digest('hex').slice(0, 16);
+}
+
+/**
+ * The members on their own, as `nft -f` reads it: each set emptied and filled again in ONE
+ * transaction, so no packet ever sees a restricted project half listed.
+ */
+export function egressMembersScript(members: EgressMembers): string {
+	const elements = egressElements(members);
+	const lines: string[] = [];
+	for (const [set, values] of [
+		['bridges', elements.bridges],
+		['restricted', elements.restricted],
+		['allow_any', elements.allowAny],
+		['allow_port', elements.allowPort]
+	] as const) {
+		lines.push(`flush set inet ${EGRESS_TABLE} ${set}`);
+		if (values.length > 0) {
+			lines.push(`add element inet ${EGRESS_TABLE} ${set} { ${values.join(', ')} }`);
+		}
+	}
+	return `${lines.join('\n')}\n`;
 }
 
 /**
@@ -310,7 +436,14 @@ export function egressFingerprint(pool: string, policy: EgressPolicy): string {
  * It is ONE table beside netavark's, hooked into forwarding just before it, and it touches only
  * packets from the pool, so the pods' networks never meet it. Per container, keyed by its address:
  *
+ *   - IPv6 from any project's bridge is dropped, forwarded or addressed to the namespace itself:
+ *     the networks are IPv4 only and every rule below is an IPv4 rule, so IPv6 would pass them all.
+ *     Matched by the bridge (`bridges`), since an IPv6 packet carries no address from the pool.
  *   - `sent`: everything it sent (packets, bytes), replies to its own callers included.
+ *   - a project with an allowlist (`restricted`, by its /28): every packet it sends that is not a
+ *     reply must be to an address it lists, on a port it lists (`allow_any`, `allow_port`), or it
+ *     is refused and counted in `blocked`. Checked on every packet, not only a new connection, so a
+ *     destination taken off the list is cut at once. Its own /28 is always listed.
  *   - a connection it OPENS (`ct direction original`, state new): refused when it is to a closed
  *     port, over the rate, or over the number it may hold; counted in `opened` when it is not.
  *     A UDP flow stays "new" until something answers, so a flood at a silent address is held to
@@ -320,9 +453,12 @@ export function egressFingerprint(pool: string, policy: EgressPolicy): string {
  *
  * Connections TO it (the front door's, websockets) are untouched: they began on the other side.
  */
-export function egressRuleset(pool: string, policy: EgressPolicy = EGRESS_POLICY): string {
+export function egressRuleset(pool: string, policy: EgressPolicy = EGRESS_POLICY, members: EgressMembers = NO_MEMBERS): string {
 	parseCidr(pool);
+	const elements = egressElements(members);
 	const counted = (name: string) => `\tset ${name} { type ipv4_addr; flags dynamic; counter; size 65536; }`;
+	const listed = (name: string, type: string, values: readonly string[], interval: boolean) =>
+		`\tset ${name} { type ${type};${interval ? ' flags interval;' : ''}${values.length > 0 ? ` elements = { ${values.join(', ')} };` : ''} }`;
 	const lines = [
 		`table inet ${EGRESS_TABLE}`,
 		`delete table inet ${EGRESS_TABLE}`,
@@ -332,18 +468,38 @@ export function egressRuleset(pool: string, policy: EgressPolicy = EGRESS_POLICY
 		counted('opened'),
 		counted('refused'),
 		counted('throttled'),
+		counted('blocked'),
 		'\tset rate { type ipv4_addr; flags dynamic; timeout 1m; size 65536; }',
 		'\tset bandwidth { type ipv4_addr; flags dynamic; timeout 1m; size 65536; }',
 		'\tset held { type ipv4_addr; flags dynamic; size 65536; }',
+		listed('bridges', 'ifname', elements.bridges, false),
+		listed('restricted', 'ipv4_addr', elements.restricted, true),
+		listed('allow_any', 'ipv4_addr . ipv4_addr', elements.allowAny, true),
+		listed('allow_port', 'ipv4_addr . ipv4_addr . inet_service', elements.allowPort, true),
+		'',
+		'\tchain input {',
+		'\t\ttype filter hook input priority filter - 10; policy accept;',
+		'\t\tmeta nfproto ipv6 iifname @bridges counter drop',
+		'\t}',
 		'',
 		'\tchain forward {',
 		'\t\ttype filter hook forward priority filter - 10; policy accept;',
+		'\t\tmeta nfproto ipv6 iifname @bridges counter drop',
 		'\t\tmeta nfproto != ipv4 return',
 		`\t\tip saddr != ${pool} return`,
 		'\t\tupdate @sent { ip saddr }',
 		'\t\tct direction reply return',
+		'\t\tip saddr @restricted jump allowlist',
 		'\t\tct state new jump open',
 		`\t\tadd @bandwidth { ip saddr limit rate over ${policy.bytesPerSecond} bytes/second burst ${policy.burstBytes} bytes } update @throttled { ip saddr } drop`,
+		'\t}',
+		'',
+		'\tchain allowlist {',
+		'\t\tip saddr . ip daddr @allow_any return',
+		'\t\tmeta l4proto { tcp, udp } ip saddr . ip daddr . th dport @allow_port return',
+		'\t\tupdate @blocked { ip saddr }',
+		'\t\tmeta l4proto tcp reject with tcp reset',
+		'\t\treject with icmpx admin-prohibited',
 		'\t}',
 		'',
 		'\tchain open {'
@@ -375,9 +531,11 @@ export interface EgressCounters {
 	readonly opened: number;
 	readonly refused: number;
 	readonly throttledBytes: number;
+	/** Packets refused because the project's allowlist does not name where they were going. */
+	readonly blocked: number;
 }
 
-export const NO_EGRESS: EgressCounters = { sentBytes: 0, sentPackets: 0, opened: 0, refused: 0, throttledBytes: 0 };
+export const NO_EGRESS: EgressCounters = { sentBytes: 0, sentPackets: 0, opened: 0, refused: 0, throttledBytes: 0, blocked: 0 };
 
 /**
  * `nft -j list table inet snoutct` read back: the table's fingerprint and each address's counters.
@@ -395,7 +553,7 @@ export function parseEgress(json: string): { fingerprint: string | null; counter
 	}
 	let fingerprint: string | null = null;
 	let found = false;
-	const counters = new Map<string, { sentBytes: number; sentPackets: number; opened: number; refused: number; throttledBytes: number }>();
+	const counters = new Map<string, { -readonly [K in keyof EgressCounters]: EgressCounters[K] }>();
 	for (const item of doc.nftables) {
 		const table = item.table as { name?: string; comment?: string } | undefined;
 		if (table?.name === EGRESS_TABLE) {
@@ -403,7 +561,7 @@ export function parseEgress(json: string): { fingerprint: string | null; counter
 			fingerprint = typeof table.comment === 'string' ? table.comment : null;
 		}
 		const set = item.set as { name?: string; table?: string; elem?: { elem?: { val?: unknown; counter?: { packets?: number; bytes?: number } } }[] } | undefined;
-		if (!set || set.table !== EGRESS_TABLE || !['sent', 'opened', 'refused', 'throttled'].includes(String(set.name))) {
+		if (!set || set.table !== EGRESS_TABLE || !['sent', 'opened', 'refused', 'throttled', 'blocked'].includes(String(set.name))) {
 			continue;
 		}
 		for (const entry of set.elem ?? []) {
@@ -421,6 +579,8 @@ export function parseEgress(json: string): { fingerprint: string | null; counter
 				one.opened = packets;
 			} else if (set.name === 'refused') {
 				one.refused = packets;
+			} else if (set.name === 'blocked') {
+				one.blocked = packets;
 			} else {
 				one.throttledBytes = bytes;
 			}

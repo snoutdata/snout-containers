@@ -1,6 +1,6 @@
 {
 	"name": "snout-containers",
-	"version": "0.1.2",
+	"version": "0.1.3",
 	"private": true,
 	"description": "Runs OCI images declared in a directory, each under gVisor, with memory and CPU limits, a network of its project's own, restarts and logs. SnoutData Cloud's container runner.",
 	"license": "Apache-2.0",

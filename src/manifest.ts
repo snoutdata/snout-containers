@@ -12,8 +12,13 @@
  *       "containers": [
  *         { "name": "whatsapp", "image": "ghcr.io/acme/wa@sha256:…", "port": 8080, "hostPort": 46432,
  *           "env": { "DATABASE_URL": "…" }, "registry": { "username": "…", "password": "…" } }
- *       ]
+ *       ],
+ *       "egress": { "allow": [{ "destination": "api.example.com", "ports": [443] }, { "destination": "203.0.113.0/24", "ports": [] }] }
  *     }
+ *
+ * `egress` is optional. Without it a container reaches the public internet (within the limits);
+ * with it, only the destinations it lists, a host name, an IPv4 address or an IPv4 range, on the
+ * ports it lists (none: any port). An empty `allow` reaches nothing outside the project.
  *
  * A file that does not parse, or breaks a rule, is skipped with its reason and the project's
  * containers are left exactly as they were: a typo must never stop a running container.
@@ -21,12 +26,68 @@
 
 import { readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { isContainerName, isProjectName, type ContainerSpec, type Limits } from './recipe.js';
+import { isContainerName, isProjectName, normaliseCidr, type ContainerSpec, type Limits } from './recipe.js';
+
+/** One destination of a project's allowlist, as the manifest says it. */
+export interface AllowEntry {
+	/** A host name, an IPv4 address, or an IPv4 range (`a.b.c.d/n`). */
+	readonly destination: string;
+	/** The ports it may be reached on; empty means any. */
+	readonly ports: readonly number[];
+}
 
 export interface ProjectManifest {
 	readonly project: string;
 	readonly limits: Limits;
 	readonly containers: readonly ContainerSpec[];
+	/** Where its containers may send, when the project restricts it; null when it does not. */
+	readonly egress: { readonly allow: readonly AllowEntry[] } | null;
+}
+
+/** The most entries an allowlist holds, and ports one entry names. */
+export const MAX_ALLOW = 64;
+export const MAX_ALLOW_PORTS = 16;
+
+const HOST_NAME = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}$/;
+const IPV4 = /^\d{1,3}(?:\.\d{1,3}){3}(?:\/\d{1,2})?$/;
+
+/** Whether a destination is an IPv4 address or range (true), a host name (false), or neither (null). */
+export function destinationKind(destination: string): 'address' | 'name' | null {
+	if (IPV4.test(destination)) {
+		try {
+			normaliseCidr(destination);
+			return 'address';
+		} catch {
+			return null;
+		}
+	}
+	return HOST_NAME.test(destination) ? 'name' : null;
+}
+
+function checkEgress(value: unknown): { ok: true; egress: ProjectManifest['egress'] } | { ok: false; reason: string } {
+	if (value === undefined || value === null) {
+		return { ok: true, egress: null };
+	}
+	const allow = (value as { allow?: unknown }).allow;
+	if (typeof value !== 'object' || !Array.isArray(allow)) {
+		return { ok: false, reason: 'egress is { "allow": [ … ] }' };
+	}
+	if (allow.length > MAX_ALLOW) {
+		return { ok: false, reason: `egress.allow holds at most ${MAX_ALLOW} destinations` };
+	}
+	const entries: AllowEntry[] = [];
+	for (const item of allow as Record<string, unknown>[]) {
+		const destination = String(item?.destination ?? '').trim().toLowerCase();
+		if (!destinationKind(destination)) {
+			return { ok: false, reason: `egress: ${JSON.stringify(item?.destination)} is not a host name, an IPv4 address or an IPv4 range` };
+		}
+		const ports = item.ports === undefined ? [] : item.ports;
+		if (!Array.isArray(ports) || ports.length > MAX_ALLOW_PORTS || ports.some((port) => !Number.isInteger(port) || port < 1 || port > 65535)) {
+			return { ok: false, reason: `egress: ${destination}'s ports are up to ${MAX_ALLOW_PORTS} whole numbers, 1 to 65535` };
+		}
+		entries.push({ destination, ports: [...new Set(ports as number[])].sort((a, b) => a - b) });
+	}
+	return { ok: true, egress: { allow: entries } };
 }
 
 export type Read = { ok: true; manifest: ProjectManifest } | { ok: false; project: string; reason: string };
@@ -109,7 +170,11 @@ export function checkManifest(fileProject: string, value: unknown): Read {
 			env
 		});
 	}
-	return { ok: true, manifest: { project: fileProject, limits: { memoryMb, cpuPercent }, containers } };
+	const egress = checkEgress(raw.egress);
+	if (!egress.ok) {
+		return fail(egress.reason);
+	}
+	return { ok: true, manifest: { project: fileProject, limits: { memoryMb, cpuPercent }, containers, egress: egress.egress } };
 }
 
 /** Every `<project>.json` in the directory. A missing directory is an empty one. */

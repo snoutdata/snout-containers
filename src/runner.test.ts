@@ -17,13 +17,16 @@ interface Call {
 function fakeEngine(runtime = 'runsc-snoutct') {
 	const calls: Call[] = [];
 	const containers: { Names: string[]; Labels: Record<string, string>; State: string; ExitCode: number }[] = [];
-	const nets: { name: string; subnets: { subnet: string }[]; labels: Record<string, string> }[] = [
-		{ name: 'podman', subnets: [{ subnet: '10.88.0.0/16' }], labels: {} }
+	const nets: { name: string; subnets: { subnet: string }[]; labels: Record<string, string>; network_interface: string }[] = [
+		{ name: 'podman', subnets: [{ subnet: '10.88.0.0/16' }], labels: {}, network_interface: 'podman0' }
 	];
 	const images = new Set<string>();
 	/** The host's firewall, as nft in rootless podman's namespace would keep it. */
 	const firewall = {
 		table: null as string | null,
+		/** The last `flush set …` script: the allowlists and bridges applied on their own. */
+		members: null as string | null,
+		membersApplied: 0,
 		applied: 0,
 		broken: false,
 		counters: new Map<string, { sentBytes: number; refused: number }>(),
@@ -50,7 +53,13 @@ function fakeEngine(runtime = 'runsc-snoutct') {
 			if (firewall.broken) {
 				return { code: 1, stdout: '', stderr: 'Error: Could not process rule: Operation not permitted' };
 			}
+			if (nft[0] === '-f' && (options?.input ?? '').startsWith('flush set')) {
+				firewall.members = options?.input ?? '';
+				firewall.membersApplied += 1;
+				return ok();
+			}
 			if (nft[0] === '-f') {
+				firewall.members = null;
 				firewall.table = options?.input ?? '';
 				firewall.applied += 1;
 				firewall.counters.clear();
@@ -82,7 +91,7 @@ function fakeEngine(runtime = 'runsc-snoutct') {
 			const subnet = args[args.indexOf('--subnet') + 1] as string;
 			const labels: Record<string, string> = {};
 			for (const [i, a] of args.entries()) if (a === '--label') { const [k, v] = (args[i + 1] as string).split('='); labels[k as string] = v as string; }
-			nets.push({ name, subnets: [{ subnet }], labels });
+			nets.push({ name, subnets: [{ subnet }], labels, network_interface: `podman${nets.length}` });
 			return ok(name);
 		}
 		if (verb === 'network' && sub === 'rm') {
@@ -117,14 +126,21 @@ function fakeEngine(runtime = 'runsc-snoutct') {
 	return { exec, calls, containers, nets, images, firewall };
 }
 
-async function setup(runtime?: string) {
+async function setup(runtime?: string, dns: Record<string, string[]> = {}) {
 	const root = await mkdtemp(join(tmpdir(), 'ct-'));
 	const manifests = join(root, 'manifests');
 	const state = join(root, 'state');
 	await mkdir(manifests);
 	const engine = fakeEngine(runtime);
 	let clock = Date.parse('2026-10-13T19:00:00.500Z');
-	const runner = createRunner({ exec: engine.exec, manifests, state, bind: ['127.0.0.1', '10.0.1.20'], now: () => clock });
+	const resolve4 = async (name: string) => {
+		const found = dns[name];
+		if (!found) {
+			throw new Error(`queryA ENOTFOUND ${name}`);
+		}
+		return found;
+	};
+	const runner = createRunner({ exec: engine.exec, manifests, state, bind: ['127.0.0.1', '10.0.1.20'], now: () => clock, resolve4 });
 	const put = (project: string, body: unknown) => writeFile(join(manifests, `${project}.json`), typeof body === 'string' ? body : JSON.stringify(body));
 	const status = () => JSON.parse(readFileSync(join(state, 'status.json'), 'utf8'));
 	return { root, manifests, state, engine, runner, put, status, advance: (ms: number) => (clock += ms) };
@@ -357,4 +373,95 @@ test('a running total with an epoch: it grows while the runner lives, and a new 
 	await again.step();
 	row = (await again.step())[0];
 	assert.equal(row?.egress?.totalSentBytes, 500);
+});
+
+test('a project with an allowlist: its sets are in place before its container runs, names resolved; bridges for every project', async () => {
+	const dns: Record<string, string[]> = { 'api.example.com': ['203.0.113.9'] };
+	const t = await setup(undefined, dns);
+	await t.put('free', manifest('free', { hostPort: 47432 }));
+	await t.put('acme', { ...manifest('acme'), egress: { allow: [{ destination: 'api.example.com', ports: [443] }, { destination: '198.51.100.0/24' }] } });
+	const rows = await t.runner.step();
+	assert.deepEqual(rows.map((r) => r.status), ['starting', 'starting']);
+	const members = t.engine.firewall.members ?? '';
+	const acme = t.engine.nets.find((n) => n.name === 'snoutct-acme')?.subnets[0]?.subnet;
+	const free = t.engine.nets.find((n) => n.name === 'snoutct-free')?.subnets[0]?.subnet;
+	assert.ok(acme && free);
+	assert.ok(members.includes(`add element inet snoutct restricted { ${acme} }`), members);
+	assert.ok(members.includes(`${acme} . 203.0.113.9/32 . 443`));
+	assert.ok(members.includes(`${acme} . 198.51.100.0/24`));
+	assert.ok(!members.includes(`${free} .`), 'a project with no allowlist is not restricted');
+	assert.match(members, /add element inet snoutct bridges \{ "podman\d", "podman\d" \}/);
+	// The sets went in before acme's container was run.
+	const order = t.engine.calls.map((c) => (c.command === 'systemd-run' && c.args.includes('-f') ? 'nft' : c.args[0] === 'run' ? `run ${c.args[c.args.indexOf('--name') + 1]}` : ''));
+	const acmeRun = order.indexOf('run snoutct-acme-wa');
+	assert.ok(acmeRun > 0 && order.slice(0, acmeRun).includes('nft'));
+
+	// Unchanged: nothing applied again. A name that moves: applied again within a minute, the old
+	// address kept for the hour.
+	const before = t.engine.firewall.membersApplied;
+	t.advance(5_000);
+	await t.runner.step();
+	assert.equal(t.engine.firewall.membersApplied, before);
+	dns['api.example.com'] = ['203.0.113.10'];
+	t.advance(61_000);
+	await t.runner.step();
+	assert.ok((t.engine.firewall.members ?? '').includes('203.0.113.10/32 . 443'));
+	assert.ok((t.engine.firewall.members ?? '').includes('203.0.113.9/32 . 443'), 'an address a name gave in the last hour stays');
+	t.advance(61 * 60_000);
+	await t.runner.step();
+	assert.ok(!(t.engine.firewall.members ?? '').includes('203.0.113.9/32'), 'an hour later it goes');
+
+	// Cleared: the project is not restricted any more.
+	await t.put('acme', manifest('acme'));
+	t.advance(5_000);
+	await t.runner.step();
+	assert.ok(!(t.engine.firewall.members ?? '').includes(`restricted { ${acme}`));
+});
+
+test('a table applied whole carries the allowlists, so a restricted project is never open in between', async () => {
+	const t = await setup(undefined, {});
+	await t.put('acme', { ...manifest('acme'), egress: { allow: [{ destination: '198.51.100.0/24', ports: [5432] }] } });
+	await t.runner.step();
+	t.engine.firewall.table = null;
+	t.advance(61_000);
+	await t.runner.step();
+	const acme = t.engine.nets.find((n) => n.name === 'snoutct-acme')?.subnets[0]?.subnet;
+	assert.ok((t.engine.firewall.table ?? '').includes(`set restricted { type ipv4_addr; flags interval; elements = { ${acme} }; }`));
+	assert.ok((t.engine.firewall.table ?? '').includes(`${acme} . 198.51.100.0/24 . 5432`));
+});
+
+test('a name that never resolves leaves the project reaching only itself; a host that cannot restrict runs it not at all', async () => {
+	const t = await setup(undefined, {});
+	await t.put('acme', { ...manifest('acme'), egress: { allow: [{ destination: 'gone.example.com', ports: [443] }] } });
+	const rows = await t.runner.step();
+	assert.equal(rows[0]?.status, 'starting');
+	const acme = t.engine.nets.find((n) => n.name === 'snoutct-acme')?.subnets[0]?.subnet;
+	assert.ok((t.engine.firewall.members ?? '').includes(`allow_any { ${acme} . ${acme} }`));
+	assert.ok(!(t.engine.firewall.members ?? '').includes('allow_port {'));
+
+	const root = await mkdtemp(join(tmpdir(), 'ct-'));
+	await mkdir(join(root, 'm'));
+	await writeFile(join(root, 'm', 'acme.json'), JSON.stringify({ ...manifest('acme'), egress: { allow: [] } }));
+	const engine = fakeEngine();
+	const off = createRunner({ exec: engine.exec, manifests: join(root, 'm'), state: join(root, 's'), bind: ['127.0.0.1'], egress: false });
+	const offRows = await off.step();
+	assert.equal(offRows[0]?.status, 'failed');
+	assert.match(offRows[0]?.detail ?? '', /cannot hold a container to an allowlist/);
+	assert.equal(engine.containers.length, 0);
+});
+
+test('measure mode: a project with an allowlist still never starts while its sets cannot go in', async () => {
+	const root = await mkdtemp(join(tmpdir(), 'ct-'));
+	await mkdir(join(root, 'm'));
+	await writeFile(join(root, 'm', 'acme.json'), JSON.stringify({ ...manifest('acme'), egress: { allow: [] } }));
+	await writeFile(join(root, 'm', 'free.json'), JSON.stringify(manifest('free', { hostPort: 47432 })));
+	const engine = fakeEngine();
+	engine.firewall.broken = true;
+	const runner = createRunner({ exec: engine.exec, manifests: join(root, 'm'), state: join(root, 's'), bind: ['127.0.0.1'], egress: { enforce: false } });
+	const rows = await runner.step();
+	const by = Object.fromEntries(rows.map((r) => [r.project, r]));
+	assert.equal(by.free?.status, 'starting');
+	assert.equal(by.acme?.status, 'failed');
+	assert.match(by.acme?.detail ?? '', /not started: the limits on what containers send could not be put in place/);
+	assert.deepEqual(engine.containers.map((c) => c.Names[0]), ['snoutct-free-wa']);
 });

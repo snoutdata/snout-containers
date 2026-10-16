@@ -50,3 +50,36 @@ test('the directory: one file per project, bad names and bad JSON reported, a mi
 	assert.deepEqual(reads.map((r) => `${r.ok ? r.manifest.project : r.project}:${r.ok}`), ['Bad:false', 'acme:true', 'zeta:false']);
 	assert.deepEqual(await readManifests(join(dir, 'nope')), []);
 });
+
+test('an allowlist reads: host names, addresses and ranges, ports sorted, none meaning any; absent is null', () => {
+	assert.equal(checkManifest('acme', good).ok && (checkManifest('acme', good) as { ok: true; manifest: { egress: unknown } }).manifest.egress, null);
+	const read = checkManifest('acme', {
+		...good,
+		egress: { allow: [{ destination: 'API.Example.com', ports: [8443, 443, 443] }, { destination: '203.0.113.0/24' }, { destination: '198.51.100.7', ports: [] }] }
+	});
+	assert.equal(read.ok, true);
+	if (read.ok) {
+		assert.deepEqual(read.manifest.egress, {
+			allow: [
+				{ destination: 'api.example.com', ports: [443, 8443] },
+				{ destination: '203.0.113.0/24', ports: [] },
+				{ destination: '198.51.100.7', ports: [] }
+			]
+		});
+	}
+	const empty = checkManifest('acme', { ...good, egress: { allow: [] } });
+	assert.deepEqual(empty.ok && empty.manifest.egress, { allow: [] });
+	for (const [egress, why] of [
+		[{ allow: 'x' }, /egress is/],
+		[{ allow: [{ destination: '2001:db8::1' }] }, /not a host name/],
+		[{ allow: [{ destination: '300.1.1.1' }] }, /not a host name/],
+		[{ allow: [{ destination: '1.2.3.4/40' }] }, /not a host name/],
+		[{ allow: [{ destination: '*.example.com' }] }, /not a host name/],
+		[{ allow: [{ destination: 'example.com', ports: [0] }] }, /ports are/],
+		[{ allow: Array.from({ length: 65 }, () => ({ destination: 'example.com' })) }, /at most 64/]
+	] as [unknown, RegExp][]) {
+		const bad = checkManifest('acme', { ...good, egress });
+		assert.equal(bad.ok, false);
+		assert.match(bad.ok ? '' : bad.reason, why);
+	}
+});

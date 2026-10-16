@@ -68,7 +68,7 @@ test('the egress ruleset: one table, the pool only, port 25 closed, the rate, th
 	assert.ok(rules.includes('ct count over 1000'));
 	assert.ok(rules.includes('limit rate over 2097152 bytes/second burst 8388608 bytes'));
 	assert.notEqual(egressFingerprint('10.95.0.0/16', EGRESS_POLICY), egressFingerprint('10.96.0.0/16', EGRESS_POLICY));
-	assert.ok(!egressRuleset('10.95.0.0/16', { ...EGRESS_POLICY, closedPorts: [] }).includes('dport'));
+	assert.ok(!egressRuleset('10.95.0.0/16', { ...EGRESS_POLICY, closedPorts: [] }).includes('tcp dport {'));
 	assert.throws(() => egressRuleset('nope'), /not an IPv4 CIDR/);
 });
 
@@ -86,7 +86,57 @@ test('nft -j output reads back as each address\'s counters and the table\'s fing
 	});
 	const read = parseEgress(json);
 	assert.equal(read?.fingerprint, 'abc');
-	assert.deepEqual(read?.counters.get('10.95.0.2'), { sentBytes: 44527835, sentPackets: 2067, opened: 0, refused: 5, throttledBytes: 2238636 });
+	assert.deepEqual(read?.counters.get('10.95.0.2'), { sentBytes: 44527835, sentPackets: 2067, opened: 0, refused: 5, throttledBytes: 2238636, blocked: 0 });
 	assert.equal(parseEgress('{"nftables":[{"metainfo":{}}]}'), null);
 	assert.equal(parseEgress('not json'), null);
+});
+
+test('IPv6 from a project bridge is dropped, forwarded or not, before any IPv4 rule', async () => {
+	const { egressRuleset } = await import('./recipe.js');
+	const rules = egressRuleset('10.95.0.0/16', undefined, { bridges: ['podman3', 'podman4'], restricted: [] });
+	assert.ok(rules.includes('set bridges { type ifname; elements = { "podman3", "podman4" }; }'));
+	const forward = rules.slice(rules.indexOf('chain forward {'));
+	const lines = forward.split('\n').map((line) => line.trim());
+	assert.equal(lines[2], 'meta nfproto ipv6 iifname @bridges counter drop', 'the IPv6 drop is the first rule');
+	assert.equal(lines[3], 'meta nfproto != ipv4 return');
+	const input = rules.slice(rules.indexOf('chain input {'), rules.indexOf('chain forward {'));
+	assert.match(input, /hook input .*\n\t\tmeta nfproto ipv6 iifname @bridges counter drop/);
+	// With no bridges the set is empty, never `elements = { }`, which nft refuses.
+	assert.ok(egressRuleset('10.95.0.0/16').includes('set bridges { type ifname; }'));
+	// A name nft would read as something else never gets in.
+	assert.ok(!egressRuleset('10.95.0.0/16', undefined, { bridges: ['x"; flush ruleset; "'], restricted: [] }).includes('flush'));
+});
+
+test('an allowlist: its own /28, what it lists on any port, each listed port, no overlaps, every packet checked', async () => {
+	const { egressRuleset, egressElements, egressMembersScript, egressMembersKey } = await import('./recipe.js');
+	const members = {
+		bridges: ['podman3'],
+		restricted: [
+			{
+				subnet: '10.95.0.16/28',
+				allow: [
+					{ cidrs: ['203.0.113.9'], ports: [443, 8443] },
+					{ cidrs: ['198.51.100.0/24', '198.51.100.7'], ports: [] },
+					{ cidrs: ['198.51.100.8'], ports: [443] },
+					{ cidrs: ['203.0.113.0/28'], ports: [443] }
+				]
+			}
+		]
+	};
+	const elements = egressElements(members);
+	assert.deepEqual(elements.restricted, ['10.95.0.16/28']);
+	assert.deepEqual(elements.allowAny, ['10.95.0.16/28 . 10.95.0.16/28', '10.95.0.16/28 . 198.51.100.0/24']);
+	assert.deepEqual(elements.allowPort, ['10.95.0.16/28 . 203.0.113.0/28 . 443', '10.95.0.16/28 . 203.0.113.9/32 . 8443']);
+	const rules = egressRuleset('10.95.0.0/16', undefined, members);
+	const forward = rules.slice(rules.indexOf('chain forward {'), rules.indexOf('chain allowlist {'));
+	assert.ok(forward.indexOf('ct direction reply return') < forward.indexOf('ip saddr @restricted jump allowlist'), 'replies to callers are never checked');
+	assert.ok(forward.indexOf('ip saddr @restricted jump allowlist') < forward.indexOf('ct state new jump open'), 'every packet, not only a new connection');
+	assert.match(rules, /chain allowlist \{\n\t\tip saddr \. ip daddr @allow_any return\n\t\tmeta l4proto \{ tcp, udp \} ip saddr \. ip daddr \. th dport @allow_port return\n\t\tupdate @blocked \{ ip saddr \}/);
+	assert.ok(rules.includes('set allow_port { type ipv4_addr . ipv4_addr . inet_service; flags interval; elements = { 10.95.0.16/28 . 203.0.113.0/28 . 443, 10.95.0.16/28 . 203.0.113.9/32 . 8443 }; }'));
+	const script = egressMembersScript(members);
+	assert.match(script, /^flush set inet snoutct bridges\nadd element inet snoutct bridges \{ "podman3" \}\nflush set inet snoutct restricted\n/);
+	assert.ok(script.includes('add element inet snoutct allow_any { 10.95.0.16/28 . 10.95.0.16/28, 10.95.0.16/28 . 198.51.100.0/24 }'));
+	assert.equal(egressMembersScript({ bridges: [], restricted: [] }), 'flush set inet snoutct bridges\nflush set inet snoutct restricted\nflush set inet snoutct allow_any\nflush set inet snoutct allow_port\n');
+	assert.equal(egressMembersKey(members), egressMembersKey({ ...members }));
+	assert.notEqual(egressMembersKey(members), egressMembersKey({ ...members, restricted: [] }));
 });

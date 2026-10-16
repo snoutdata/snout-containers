@@ -21,6 +21,14 @@
  * running containers are left running. Once a minute its counters are read, and each container's
  * row carries what it sent, opened, was refused and was throttled in the last hour.
  *
+ * The allowlists (recipe.ts, `EgressMembers`): a project whose manifest has `egress.allow` reaches
+ * only what it lists. Host names in it are looked up every minute, and an address a name gave in
+ * the last hour stays listed, so a name that answers with a rotating set keeps working. Every
+ * project network's bridge and every restricted project's /28 with what it may reach are put in
+ * the table's sets in one transaction whenever they change, and BEFORE a container of a project
+ * whose network was just made is started. A restricted project's containers never start while that
+ * cannot be done, whatever `egress.enforce` says: its owner asked for less, and gets less or none.
+ *
  * And every minute, `collectLogs`: what each container printed since last time, as a JSONL file in
  * the spool, which whoever ships logs reads and deletes.
  *
@@ -30,16 +38,23 @@
  */
 
 import { randomBytes } from 'node:crypto';
+import { Resolver } from 'node:dns/promises';
 import { mkdir, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { readManifests, type ProjectManifest } from './manifest.js';
+import { destinationKind, readManifests, type ProjectManifest } from './manifest.js';
 import {
 	allocateSubnet,
 	containerName,
 	EGRESS_POLICY,
 	EGRESS_TABLE,
 	egressFingerprint,
+	egressMembersKey,
+	egressMembersScript,
 	egressRuleset,
+	normaliseCidr,
+	NO_MEMBERS,
+	type AllowedDestination,
+	type EgressMembers,
 	NO_EGRESS,
 	parseEgress,
 	type EgressCounters,
@@ -128,6 +143,8 @@ export interface RunnerOptions {
 	 * gets nft's arguments as "$@", and the ruleset on stdin.
 	 */
 	readonly systemdRun?: string;
+	/** A host name's IPv4 addresses, for the allowlists. The runner's own resolver by default. */
+	readonly resolve4?: (name: string) => Promise<string[]>;
 	readonly now?: () => number;
 	readonly log?: (message: string) => void;
 }
@@ -149,6 +166,8 @@ const EGRESS_EVERY_MS = 60_000;
 const EGRESS_RETRY_MS = 15_000;
 /** The window a container's egress is summed over. */
 const EGRESS_WINDOW_MS = 60 * 60_000;
+/** How long an address a listed host name gave stays listed after the name stops giving it. */
+const NAME_REMEMBER_MS = 60 * 60_000;
 /**
  * Run on the HOST as its user, by systemd: rootless podman's network namespace, then nft. A shell,
  * because systemd-run looks for the executable in the runner's own filesystem before sending the
@@ -158,6 +177,20 @@ const NFT_ON_HOST = 'exec podman unshare --rootless-netns /usr/sbin/nft "$@"';
 
 /** Names podman itself reads, refused for a multi-line value (which has to go through podman's environment). */
 const PODMAN_ENV = /^(PATH|HOME|USER|LOGNAME|SHELL|LANG|LC_[A-Z]+|TMPDIR|XDG_[A-Z_]+|DBUS_[A-Z_]+|CONTAINER_[A-Z_]+|CONTAINERS_[A-Z_]+|PODMAN_[A-Z_]+|REGISTRY_AUTH_FILE|NOTIFY_SOCKET|SSL_CERT_[A-Z_]+|HTTPS?_PROXY|NO_PROXY)$/;
+
+interface Network {
+	readonly name: string;
+	readonly subnets: string[];
+	readonly project: string | null;
+	/** The bridge podman made for it (`network_interface`); null when it did not say. */
+	readonly bridge: string | null;
+}
+
+/** A Resolver of the runner's own, with a timeout, so one slow name never holds a step for long. */
+function defaultResolve4(): (name: string) => Promise<string[]> {
+	const resolver = new Resolver({ timeout: 3000, tries: 2 });
+	return (name) => resolver.resolve4(name);
+}
 
 interface Actual {
 	readonly id: string;
@@ -211,6 +244,13 @@ export function createRunner(options: RunnerOptions) {
 	const totals = new Map<string, { epoch: string; sentBytes: number }>();
 	let lastMeasured = 0;
 	const sent = new Map<string, { at: number; delta: EgressCounters }[]>();
+	const resolve4 = options.resolve4 ?? defaultResolve4();
+	/** Each listed host name: when it was last looked up, and every address it gave with when. */
+	const names = new Map<string, { at: number; addresses: Map<string, number> }>();
+	/** The members as last applied to the table; null when they have not been, or could not be. */
+	let appliedMembers: string | null = null;
+	let membersFailure: string | null = null;
+	let members: EgressMembers = NO_MEMBERS;
 
 	function track(key: string): Tracking {
 		let one = tracking.get(key);
@@ -272,7 +312,7 @@ export function createRunner(options: RunnerOptions) {
 			egress = { ok: true, reason: null, at: now() };
 			return parsed.counters;
 		}
-		const applied = await nft(['-f', '-'], egressRuleset(pool, policy));
+		const applied = await nft(['-f', '-'], egressRuleset(pool, policy, members));
 		if (applied.code !== 0) {
 			egress = { ok: false, reason: `the limits on what containers send could not be put in place: ${lastLines(applied.stderr, 1) || `exit ${applied.code}`}`, at: now() };
 			log(egress.reason as string);
@@ -280,6 +320,9 @@ export function createRunner(options: RunnerOptions) {
 		}
 		log(parsed ? 'egress limits changed; applied again' : 'egress limits applied');
 		egress = { ok: true, reason: null, at: now() };
+		// The table carries the members it was made with.
+		appliedMembers = egressMembersKey(members);
+		membersFailure = null;
 		// A new table counts from zero.
 		lastCounters = new Map();
 		primed = true;
@@ -322,7 +365,8 @@ export function createRunner(options: RunnerOptions) {
 				sentPackets: current.sentPackets - base.sentPackets,
 				opened: current.opened - base.opened,
 				refused: current.refused - base.refused,
-				throttledBytes: current.throttledBytes - base.throttledBytes
+				throttledBytes: current.throttledBytes - base.throttledBytes,
+				blocked: current.blocked - base.blocked
 			};
 			const samples = sent.get(key) ?? [];
 			samples.push({ at, delta });
@@ -358,6 +402,7 @@ export function createRunner(options: RunnerOptions) {
 			total.opened += delta.opened;
 			total.refused += delta.refused;
 			total.throttledBytes += delta.throttledBytes;
+			total.blocked += delta.blocked;
 		}
 		return total;
 	}
@@ -394,7 +439,7 @@ export function createRunner(options: RunnerOptions) {
 		});
 	}
 
-	async function networks(): Promise<{ name: string; subnets: string[]; project: string | null }[]> {
+	async function networks(): Promise<Network[]> {
 		const result = await exec(podman, ['network', 'ls', '--format', 'json']);
 		if (result.code !== 0) {
 			throw new Error(`podman network ls failed: ${lastLines(result.stderr, 1)}`);
@@ -403,17 +448,20 @@ export function createRunner(options: RunnerOptions) {
 			name?: string;
 			subnets?: { subnet?: string }[];
 			labels?: Record<string, string>;
+			network_interface?: string;
 		}[];
 		return rows.map((row) => ({
 			name: String(row.name ?? ''),
 			subnets: (row.subnets ?? []).map((s) => String(s.subnet ?? '')).filter(Boolean),
-			project: row.labels?.[LABEL_PROJECT] ?? null
+			project: row.labels?.[LABEL_PROJECT] ?? null,
+			bridge: typeof row.network_interface === 'string' && row.network_interface ? row.network_interface : null
 		}));
 	}
 
-	async function ensureNetwork(project: string, existing: { name: string; subnets: string[] }[]): Promise<void> {
+	/** Makes the project's network when it has none. True when it was made just now. */
+	async function ensureNetwork(project: string, existing: Network[]): Promise<boolean> {
 		if (existing.some((network) => network.name === networkName(project))) {
-			return;
+			return false;
 		}
 		const subnet = allocateSubnet(
 			pool,
@@ -423,8 +471,113 @@ export function createRunner(options: RunnerOptions) {
 		if (created.code !== 0) {
 			throw new Error(`could not make the project's network: ${lastLines(created.stderr, 1)}`);
 		}
-		existing.push({ name: networkName(project), subnets: [subnet.subnet] });
+		// Read back rather than assumed: the bridge's name is podman's to choose, and the IPv6 drop
+		// matches it.
+		const again = await networks();
+		const made = again.find((network) => network.name === networkName(project));
+		existing.push(made ?? { name: networkName(project), subnets: [subnet.subnet], project, bridge: null });
 		log(`${project}: network ${networkName(project)} on ${subnet.subnet}`);
+		return true;
+	}
+
+	/** The allowlists' host names looked up again, at most once a minute each. */
+	async function lookUp(wanted: Map<string, ProjectManifest>): Promise<void> {
+		const listed = new Set<string>();
+		for (const manifest of wanted.values()) {
+			for (const entry of manifest.egress?.allow ?? []) {
+				if (destinationKind(entry.destination) === 'name') {
+					listed.add(entry.destination);
+				}
+			}
+		}
+		for (const name of [...names.keys()]) {
+			if (!listed.has(name)) {
+				names.delete(name);
+			}
+		}
+		await Promise.all(
+			[...listed].map(async (name) => {
+				const known = names.get(name) ?? { at: 0, addresses: new Map<string, number>() };
+				if (known.at !== 0 && now() - known.at < EGRESS_EVERY_MS) {
+					return;
+				}
+				try {
+					for (const address of await resolve4(name)) {
+						known.addresses.set(address, now());
+					}
+				} catch (error) {
+					// Kept as it was: a name that stops answering keeps what it gave for an hour.
+					log(`allowlist: ${name} did not resolve: ${error instanceof Error ? error.message : String(error)}`);
+				}
+				known.at = now();
+				for (const [address, seen] of known.addresses) {
+					if (now() - seen >= NAME_REMEMBER_MS) {
+						known.addresses.delete(address);
+					}
+				}
+				names.set(name, known);
+			})
+		);
+	}
+
+	/** What the table's sets should hold, from the project networks and the manifests. */
+	function membersOf(nets: readonly Network[], wanted: Map<string, ProjectManifest>): EgressMembers {
+		const bridges: string[] = [];
+		const restricted: { subnet: string; allow: AllowedDestination[] }[] = [];
+		for (const network of nets) {
+			if (!network.project || network.name !== networkName(network.project)) {
+				continue;
+			}
+			if (network.bridge) {
+				bridges.push(network.bridge);
+			}
+			const egress = wanted.get(network.project)?.egress;
+			const subnet = network.subnets[0];
+			if (!egress || !subnet) {
+				continue;
+			}
+			restricted.push({
+				subnet,
+				allow: egress.allow.map((entry) => ({
+					cidrs:
+						destinationKind(entry.destination) === 'address'
+							? [normaliseCidr(entry.destination)]
+							: [...(names.get(entry.destination)?.addresses.keys() ?? [])].flatMap((address) => {
+									try {
+										return [normaliseCidr(address)];
+									} catch {
+										return [];
+									}
+								}),
+					ports: entry.ports
+				}))
+			});
+		}
+		return { bridges, restricted };
+	}
+
+	/**
+	 * The sets brought up to date, when they moved. A failure is held in `membersFailure`, which keeps
+	 * every restricted project's containers from starting (and, enforced, every container).
+	 */
+	async function syncMembers(nets: readonly Network[], wanted: Map<string, ProjectManifest>): Promise<void> {
+		if (!egressOptions) {
+			return;
+		}
+		members = membersOf(nets, wanted);
+		const key = egressMembersKey(members);
+		if (key === appliedMembers || !egress?.ok) {
+			return;
+		}
+		const applied = await nft(['-f', '-'], egressMembersScript(members));
+		if (applied.code !== 0) {
+			appliedMembers = null;
+			membersFailure = `the allowlists and the IPv6 drop could not be put in place: ${lastLines(applied.stderr, 1) || `exit ${applied.code}`}`;
+			log(membersFailure);
+			return;
+		}
+		appliedMembers = key;
+		membersFailure = null;
 	}
 
 	async function remove(container: Actual): Promise<void> {
@@ -497,10 +650,34 @@ export function createRunner(options: RunnerOptions) {
 
 	/** Why containers may not start for want of the egress limits; null when they may. */
 	function fence(): string | null {
-		if (!egressOptions || !egressOptions.enforce || egress?.ok) {
+		if (!egressOptions || !egressOptions.enforce) {
 			return null;
 		}
-		return egress?.reason ?? 'the limits on what containers send have not been checked yet';
+		if (!egress?.ok) {
+			return egress?.reason ?? 'the limits on what containers send have not been checked yet';
+		}
+		return membersFailure;
+	}
+
+	/** Why a project with an allowlist may not start containers; null when it may. Any mode. */
+	function restrictedFence(manifest: ProjectManifest, nets: readonly Network[]): string | null {
+		if (!manifest.egress) {
+			return null;
+		}
+		if (!egressOptions) {
+			return 'this host does not manage its firewall, so it cannot hold a container to an allowlist';
+		}
+		if (!egress?.ok) {
+			return egress?.reason ?? 'the limits on what containers send have not been checked yet';
+		}
+		if (membersFailure) {
+			return membersFailure;
+		}
+		const network = nets.find((one) => one.name === networkName(manifest.project));
+		if (!network || appliedMembers !== egressMembersKey(members) || !members.restricted.some((one) => network.subnets.includes(one.subnet))) {
+			return 'its allowlist is not in place yet';
+		}
+		return null;
 	}
 
 	async function writeStatus(rows: StatusRow[], errors: { project: string; reason: string }[], engineReason: string | null): Promise<void> {
@@ -587,12 +764,20 @@ export function createRunner(options: RunnerOptions) {
 					sent.delete(`${container.project}/${container.name}`);
 				}
 			}
-			const nets = await networks();
-			for (const network of nets) {
+			const listedNets = await networks();
+			const nets: Network[] = [];
+			for (const network of listedNets) {
 				if (network.project && !wanted.has(network.project) && !broken.has(network.project)) {
 					await exec(podman, ['network', 'rm', '--force', network.name]);
 					log(`${network.project}: network removed`);
+				} else {
+					nets.push(network);
 				}
+			}
+			// The allowlists and the bridges, before anything is started.
+			if (egressOptions) {
+				await lookUp(wanted);
+				await syncMembers(nets, wanted);
 			}
 
 			for (const manifest of wanted.values()) {
@@ -636,8 +821,15 @@ export function createRunner(options: RunnerOptions) {
 						one.restarts += 1;
 					}
 					try {
-						await ensureNetwork(manifest.project, nets);
+						if (await ensureNetwork(manifest.project, nets)) {
+							await syncMembers(nets, wanted);
+						}
 						made = true;
+						// A project that asked for an allowlist runs held to it or not at all.
+						const unrestricted = restrictedFence(manifest, nets);
+						if (unrestricted) {
+							throw new Error(`not started: ${unrestricted}`);
+						}
 						await create(manifest.project, spec, manifest.limits, hash);
 						one.startedAt = now();
 						if (!crashed) {

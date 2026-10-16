@@ -42,6 +42,10 @@ to read and delete.
   metadata service and every private range (`10/8`, `172.16/12`, `192.168/16`, `169.254/16`)
   routed to an address nothing holds. A container reaches the public internet and its own
   project's containers, and nothing else: not the host's network, not another project's containers.
+  The networks are IPv4 only, and IPv6 from a project's bridge is dropped at the firewall (below),
+  so nothing leaves a container over IPv6.
+- **An allowlist, when a project asks for one**: its containers then reach only the destinations
+  it lists (below).
 - **Limits on what it sends** (below): a connection rate, a number held open, a bandwidth, and
   port 25 closed.
 - **No secret on a command line**: the environment reaches podman through a 0600 file deleted as
@@ -61,6 +65,11 @@ from the pool:
 | Bytes a second on connections it opened | 2 MB, bursts of 8 MB |
 | TCP ports it may not open | 25 |
 
+IPv6 from any project's bridge is dropped in the same table, whether it is forwarded or addressed
+to the namespace itself: the networks have no IPv6 and every limit above is an IPv4 rule, so IPv6
+would otherwise pass them all. It is matched by the bridge (`network_interface` in `podman network
+ls`), since an IPv6 packet carries no address from the pool.
+
 Past a limit a new connection is refused (a TCP reset, an ICMP refusal otherwise) and bytes over
 the rate are dropped. A UDP flow is "new" until something answers, so a flood at a silent address
 is held to the connection rate. Connections TO a container are not limited: they began on the
@@ -76,6 +85,28 @@ moves, so a status read twice or missed never counts a byte twice. A new runner 
 the table already holds, which the runner before it counted. In SnoutData Cloud those figures go to
 the control plane, which emails the owner and us when an hour looks like abuse, and stops a
 project's containers for the rest of the month once they have sent its allowance.
+
+### Where a container may send: an allowlist
+
+By default the public internet is open to a container. A manifest may carry `egress.allow` (below);
+that project's containers then reach the destinations it lists and nothing else: a host name, an
+IPv4 address or an IPv4 range, each on the ports it lists, or any port when it lists none. The
+project's own containers always reach each other. Every packet a container sends that is not a
+reply is checked, not only a new connection, so a destination taken off the list is cut at once;
+what is refused gets a TCP reset (an ICMP refusal otherwise) and is counted in `blocked`, apart
+from `refused`, so it never reads as abuse.
+
+The firewall holds addresses, so the runner looks each host name up every minute through its own
+resolver and lists every address it gave in the last hour; a name that rotates through a set of
+addresses keeps working, and one that never resolves lists nothing. A name that answers
+differently to different resolvers (some CDNs) may be refused now and then; list its range instead.
+The rules on how much and how fast still apply to what is allowed.
+
+The sets that hold the allowlists and the bridges are replaced in one transaction whenever they
+change, without replacing the table (so its counters carry on), and before the first container of
+a project whose network was just made is started. A project with an allowlist never runs without
+it: its containers are not started while the sets cannot be put in place, in `measure` mode too,
+and with `SNOUT_CONTAINERS_EGRESS=off` they are reported `failed`.
 
 It reaches nftables through the host user's systemd: `systemd-run --user --pipe --wait` runs
 `podman unshare --rootless-netns /usr/sbin/nft` on the host, so the host needs `nftables`
@@ -194,7 +225,8 @@ directory):
       "registry": { "username": "acme", "password": "…" },
       "restartGeneration": 0
     }
-  ]
+  ],
+  "egress": { "allow": [{ "destination": "api.example.com", "ports": [443] }, { "destination": "203.0.113.0/24" }] }
 }
 ```
 
@@ -207,6 +239,9 @@ directory):
   only reaches out.
 - `registry`: for a private image. Kept in the file only; given to podman through a 0600 file.
 - `restartGeneration`: change it to make the container again from its image.
+- `egress`: optional. `allow` lists where the project's containers may send, up to 64
+  destinations, each a host name, an IPv4 address or an IPv4 range with up to 16 `ports` (none:
+  any). An empty list reaches nothing outside the project. Without `egress`, the public internet.
 
 A file that does not parse, or breaks a rule, is reported in `status.json` and its project's
 containers are left as they were. A project with no file has nothing running.
@@ -226,7 +261,8 @@ npm test        # compiles, then the unit tests: no podman needed
 
 The tests drive the runner against a fake podman: the exact commands it would run, that nothing
 secret is on a command line, that a broken engine runs nothing, that a crash is made again with a
-backoff, that two projects get two networks.
+backoff, that two projects get two networks, that IPv6 is dropped, and that an allowlist is in
+place before a restricted project's container starts.
 
 ## Licence
 
