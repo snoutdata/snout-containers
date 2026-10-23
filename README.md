@@ -124,7 +124,7 @@ anywhere else, as root:
 
 1. **gVisor**: `runsc` and its `gvisor-bin/` directory in `/usr/local/bin`, from a
    [release](https://gvisor.dev/docs/user_guide/install/).
-2. **The runtime wrapper**, `/usr/local/bin/runsc-snoutct`:
+2. **The runtime wrapper**, `/usr/local/bin/runsc-snoutct`. At its simplest:
 
    ```sh
    #!/bin/sh
@@ -134,6 +134,13 @@ anywhere else, as root:
    `--ignore-cgroups` because the limits come from the container's slice, which holds the whole
    sandbox. `--network=host` means the container's *own* network namespace through the host
    kernel's stack, which is what makes the network's deny routes apply and a published port answer.
+
+   SnoutData Cloud's own wrapper does one more thing. With `--ignore-cgroups`, runsc sizes the
+   sandbox from the host's `/proc/meminfo`, so
+   a container capped at 512 MB is told the machine's 4 GB, and Node in it sets a 1.9 GB heap limit.
+   On `create`, the wrapper reads the `MemoryMax` of the slice named in the spec's `cgroupsPath`
+   and runs runsc in a mount namespace whose `/proc/meminfo` says that, less an eighth (at least
+   64 MB) for the sandbox itself.
 3. **The engine's podman configuration**, `/etc/snoutct/containers.conf`:
 
    ```toml
