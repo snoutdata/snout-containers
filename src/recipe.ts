@@ -116,25 +116,31 @@ export interface ProjectSubnet {
 }
 
 /**
- * The first /28 in `pool` that no existing network holds. Throws when the pool is full, which on a
- * /16 is 4,096 projects on one host.
+ * The first /28 in `pool` that overlaps no existing network. Throws when the pool is full, which on
+ * a /16 is 4,096 projects on one host.
+ *
+ * OVERLAPS, not equal bases: this podman is the pods' user's, so its networks are listed beside the
+ * agent's, and the router's `snoutlr` (10.95.0.0/24, `hostServiceCompose.ts`) sits inside the default
+ * pool. Comparing bases skipped only 10.95.0.0/28 and handed out 10.95.0.16/28 inside it, in the same
+ * rootless network namespace (found 2026-10-30, read-only, before any host had both).
  */
 export function allocateSubnet(pool: string, taken: readonly string[]): ProjectSubnet {
 	const { base, bits } = parseCidr(pool);
 	if (bits > 28) {
 		throw new Error(`the pool ${pool} is smaller than one /28`);
 	}
-	const used = new Set(taken.flatMap((cidr) => {
+	const used = taken.flatMap((cidr) => {
 		try {
-			return [parseCidr(cidr).base];
+			const one = parseCidr(cidr);
+			return [{ start: one.base, end: one.base + 2 ** (32 - one.bits) }];
 		} catch {
 			return [];
 		}
-	}));
+	});
 	const count = 2 ** (28 - bits);
 	for (let i = 0; i < count; i++) {
 		const start = (base + i * 16) >>> 0;
-		if (!used.has(start)) {
+		if (!used.some((range) => start < range.end && start + 16 > range.start)) {
 			return { subnet: `${toAddress(start)}/28`, gateway: toAddress(start + 1), sink: toAddress(start + 14) };
 		}
 	}

@@ -7,6 +7,12 @@ test('a project gets the first free /28, gateway at .1 and the sink at .14', () 
 	assert.deepEqual(allocateSubnet('10.95.0.0/16', ['10.95.0.0/28', '10.88.0.0/16']).subnet, '10.95.0.16/28');
 	assert.equal(allocateSubnet('10.95.0.0/16', ['10.95.0.0/28', '10.95.0.32/28']).subnet, '10.95.0.16/28');
 	assert.throws(() => allocateSubnet('10.95.0.0/28', ['10.95.0.0/28']), /no free \/28/);
+	// The router's snoutlr (10.95.0.0/24) is listed beside these networks: nothing inside it is given.
+	assert.equal(allocateSubnet('10.95.0.0/16', ['10.95.0.0/24']).subnet, '10.95.1.0/28');
+	assert.equal(allocateSubnet('10.95.0.0/16', ['10.95.0.0/24', '10.95.1.0/28']).subnet, '10.95.1.16/28');
+	// A wider network around the pool's start, and one that only touches a /28's last address.
+	assert.equal(allocateSubnet('10.95.0.0/16', ['10.95.0.0/23']).subnet, '10.95.2.0/28');
+	assert.equal(allocateSubnet('10.95.0.0/16', ['10.95.0.15/32']).subnet, '10.95.0.16/28');
 });
 
 test('a project network denies every private range through its sink, and says whose it is', () => {
